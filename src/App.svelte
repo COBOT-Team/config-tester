@@ -17,28 +17,52 @@
   ];
 
   let angles: Array<number> = Array(JOINTS.length).fill(0);
+  let initialized = false;
 
-  // Regularly poll the joints' angles and update the angles array
-  setInterval(() => {
-    invoke("get_position", {})
-      .then((angles) => {
-        if (Array.isArray(angles)) {
-          angles.forEach((angle, i) => {
-            angles[i] = angle;
-          });
-        }
-      })
+  /**
+   * Initialize and calibrate the COBOT. Then, start listening for joint angle updates.
+   */
+  async function init() {
+    await invoke("connect", { portName: "/dev/ttyCobot0", baudRate: 115200 })
+      .then(() => console.log("COBOT connected"))
       .catch((e) => console.error(e));
-  }, 20);
+    await invoke("init", {})
+      .then(() => {
+        console.log("COBOT initialized");
+        initialized = true;
+        setInterval(() => {
+          invoke("get_position", {})
+            .then((angles) => {
+              if (Array.isArray(angles)) {
+                angles.forEach((angle, i) => {
+                  angles[i] = angle;
+                });
+              }
+            })
+            .catch((e) => console.error(e));
+        }, 1000);
+      })
+      .catch((e) => {
+        console.error(e);
+        setTimeout(init, 1000);
+      });
+  }
+
+  init();
 </script>
 
 <main>
   <h1 id="title">COBOT Config Tester</h1>
-  <div id="joints-container">
-    {#each JOINTS as joint}
-      <JointControl id={joint.id} name={joint.name} angle={angles[joint.id]} />
-    {/each}
-  </div>
+
+  {#if initialized}
+    <div id="joints-container">
+      {#each JOINTS as joint}
+        <JointControl id={joint.id} name={joint.name} angle={angles[joint.id]} />
+      {/each}
+    </div>
+  {:else}
+    <p>Initializing...</p>
+  {/if}
 </main>
 
 <style>

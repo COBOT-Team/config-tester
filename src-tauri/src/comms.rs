@@ -1,336 +1,741 @@
-use std::{error::Error, io::ErrorKind};
-
-use log::error;
-use serialport::SerialPort;
+//! # Binary Protocol
+//!
+//! Each message begins with a 3-byte header followed by a payload.
+//!
+//! | Byte | Description                |
+//! | ---- | -------------------------- |
+//! | 0    | Start byte (0x24)          |
+//! | 1    | Payload length             |
+//! | 2    | CRC of payload (crc8ccitt) |
+//! | 3... | Payload                    |
+//!
+//! ## Outgoing Message Payloads
+//!
+//! ### Log
+//!
+//! | Byte | Description    |
+//! | ---- | -------------- |
+//! | 0    | 0x00 (log)     |
+//! | 1    | Log level      |
+//! | 2    | Message length |
+//! | 3... | Message        |
+//!
+//! ### Response
+//!
+//! | Byte | Description      |
+//! | ---- | ---------------- |
+//! | 0    | 0x01 (response)  |
+//! | 1    | Response type    |
+//! | 2-5  | Command ID       |
+//! | 6... | Response payload |
+//!
+//! #### Ack Response
+//!
+//! No payload
+//!
+//! #### Done Response
+//!
+//! No payload
+//!
+//! ### Error Response
+//!
+//! | Byte | Description          |
+//! | ---- | -------------------- |
+//! | 0    | Error code           |
+//! | 1    | Error message length |
+//! | 2... | Error message        |
+//!
+//! #### Joints Response
+//!
+//! | Byte    | Description                              |
+//! | ------- | ---------------------------------------- |
+//! | 0       | Number of joints                         |
+//! | N + 1-4 | Joint N angle (int32) (deg \* 10^-3)     |
+//! | N + 5-8 | Joint N speed (int32) (deg \* 10^-3) / s |
+//!
+//! ## Incoming Message Payloads
+//!
+//! | Byte | Description  |
+//! | ---- | ------------ |
+//! | 0    | Request type |
+//! | 1-4  | Command ID   |
+//!
+//! ### Init
+//!
+//! | Byte  | Description               |
+//! | ----- | ------------------------- |
+//! | 0 - 3 | Expected firmware version |
+//!
+//! ### Calibrate
+//!
+//! | Byte | Description                     |
+//! | ---- | ------------------------------- |
+//! | 0    | Bitfield of joints to calibrate |
+//!
+//! ### Override
+//!
+//! | Byte    | Description                      |
+//! | ------- | -------------------------------- |
+//! | N + 0   | Joint ID                         |
+//! | N + 1-4 | New angle (int32) (deg \* 10^-3) |
+//!
+//! ### Get Joints
+//!
+//! No payload
+//!
+//! ### Move To
+//!
+//! | Byte    | Description                      |
+//! | ------- | -------------------------------- |
+//! | N + 0   | Joint ID                         |
+//! | N + 1-4 | New angle (int32) (deg \* 10^-3) |
+//! | N + 5-8 | Speed (int32) (deg \* 10^-3) / s |
+//!
+//! ### Move Speed
+//!
+//! | Byte    | Description                      |
+//! | ------- | -------------------------------- |
+//! | N + 0   | Joint ID                         |
+//! | N + 1-4 | Speed (int32) (deg \* 10^-3) / s |
+//!
+//! ### Follow Trajectory
+//!
+//! For N in [0 - 5]:
+//!
+//! | Byte    | Description                         |
+//! | ------- | ----------------------------------- |
+//! | N + 0-3 | Target angle (int32) (deg \* 10^-3) |
+//! | N + 4-7 | Speed (int32) (deg \* 10^-3) / s    |
+//!
+//! ### Stop
+//!
+//! | Byte | Description                |
+//! | ---- | -------------------------- |
+//! | 0    | Stop immediately?          |
+//! | 1    | Bitfield of joints to stop |
+//!
+//! ### Go Home
+//!
+//! | Byte | Description                   |
+//! | ---- | ----------------------------- |
+//! | 0    | Bitfield of joints to go home |
+//!
+//! ### Reset
+//!
+//! No payload
+//!
+//! ### Set Log Level
+//!
+//! | Byte | Description                 |
+//! | ---- | --------------------------- |
+//! | 0    | Log level (0-3, 4 for none) |
+//!
+//! ### Set Feedback
+//!
+//! | Byte | Description                                   |
+//! | ---- | --------------------------------------------- |
+//! | 0    | Bitfield of joints to enable/disable feedback |
 
 use crate::checksum::{crc8ccitt, crc8ccitt_check};
+use log::warn;
+use serialport::SerialPort;
+use std::{
+    error::Error,
+    time::{Duration, Instant},
+};
 
-/// Message types that can be sent or received from the COBOT
-pub mod msg_type {
-    pub const MSG_ERR: u8 = 0x00;
-    pub const MSG_ACK: u8 = 0x01;
-    pub const MSG_DONE: u8 = 0x02;
-    pub const MSG_INIT: u8 = 0x03;
-    pub const MSG_CAL: u8 = 0x04;
-    pub const _MSG_SET: u8 = 0x05;
-    pub const MSG_GET: u8 = 0x06;
-    pub const MSG_MOV: u8 = 0x07;
-    pub const MSG_STP: u8 = 0x08;
-    pub const _MSG_RST: u8 = 0x09;
-    pub const _MSG_HOM: u8 = 0x0A;
-    pub const MSG_POS: u8 = 0x0B;
+/// Map of error codes to error messages.
+pub const ERROR_CODES: [&str; 8] = [
+    "Other",
+    "Malformed request",
+    "Out of range",
+    "Invalid joint",
+    "Not initialized",
+    "Not calibrated",
+    "Cancelled",
+    "Invalid firmware version",
+];
 
-    /// Length of payload, indexed by message type
-    pub const PAYLOAD_LEN: [u8; 12] = [u8::MAX, 0, 0, 2, 0, 12, 0, 36, 1, 0, 0, 12];
+/// Log levels used by the COBOT.
+pub mod log_level {
+    pub const DEBUG: u8 = 0x00;
+    pub const INFO: u8 = 0x01;
+    pub const WARN: u8 = 0x02;
+    pub const ERROR: u8 = 0x03;
+    pub const NONE: u8 = 0x04;
 }
 
-pub type PayloadPair = (u8, Vec<u8>);
+/// Message types that can be received from the COBOT
+pub mod received_msg_type {
+    pub const LOG: u8 = 0x00;
+    pub const RESPONSE: u8 = 0x01;
+}
+
+/// Type of response message.
+pub mod response_type {
+    pub const ACK: u8 = 0x00;
+    pub const DONE: u8 = 0x01;
+    pub const ERROR: u8 = 0x02;
+    pub const JOINTS: u8 = 0x03;
+}
+
+/// Message types that can be sent to the COBOT.
+pub mod request_type {
+    pub const INIT: u8 = 0x00;
+    pub const CALIBRATE: u8 = 0x01;
+    pub const _OVERRIDE: u8 = 0x02;
+    pub const GET_JOINTS: u8 = 0x03;
+    pub const MOVE_TO: u8 = 0x04;
+    pub const MOVE_SPEED: u8 = 0x05;
+    pub const _FOLLOW_TRAJECTORY: u8 = 0x06;
+    pub const STOP: u8 = 0x07;
+    pub const GO_HOME: u8 = 0x08;
+    pub const RESET: u8 = 0x09;
+    pub const SET_LOG_LEVEL: u8 = 0x0A;
+    pub const SET_FEEDBACK: u8 = 0x0B;
+}
 
 /// Connection to the COBOT. Handles sending and receiving messages.
+///
+/// This struct will pass any received log messages to the standard logger. Responses are accessed
+/// by ID and will be buffered for up to 1 second before being discarded.
 pub struct CobotConnection {
-    path: String,
-    initialized: bool,
-    fw_major: u8,
-    fw_minor: u8,
-    done_queue: Vec<u8>,
+    /// Serial port to communicate with the COBOT.
+    port: Box<dyn SerialPort>,
+
+    /// Firmware version of the COBOT.
+    firmware_version: u32,
+
+    /// Command ID to use for the next command.
+    next_command_id: u32,
+
+    /// Time to wait for a response before timing out.
+    timeout: Duration,
+
+    /// List of responses and the time they were received.
+    responses: Vec<(Response, std::time::Instant)>,
 }
 
-impl CobotConnection {
-    pub fn new(path: &str, fw_major: u8, fw_minor: u8) -> Self {
-        Self {
-            path: path.to_string(),
-            initialized: false,
-            fw_major,
-            fw_minor,
-            done_queue: Vec::new(),
-        }
-    }
+/// Response received from the COBOT.
+#[derive(Clone, Debug)]
+pub struct Response {
+    /// Command ID of the command that generated this response.
+    pub command_id: u32,
 
-    fn connect_to_serial(&mut self) -> Result<Box<dyn SerialPort>, Box<dyn Error>> {
-        let mut serial_port = serialport::new(self.path.as_str(), 115_200)
-            .timeout(std::time::Duration::from_millis(100))
-            .open()?;
+    /// Type of response.
+    pub response_type: u8,
 
-        if !self.initialized {
-            self.init(&mut serial_port)?;
-        }
+    /// Payload of the response.
+    pub payload: Vec<u8>,
+}
 
-        Ok(serial_port)
-    }
+/// Error returned by the COBOT.
+#[derive(Clone, Debug)]
+pub struct CobotError {
+    /// Error code.
+    pub code: u8,
 
-    /// Calibrates the COBOT. This is required before the COBOT can be used.
-    /// This function blocks until the calibration is complete.
-    pub fn calibrate(&mut self) -> Result<(), Box<dyn Error>> {
-        let mut serial_port = self.connect_to_serial()?;
-        self.send_and_wait(&mut serial_port, msg_type::MSG_CAL, &[])?;
-        self.wait_for_done_serial(&mut serial_port, msg_type::MSG_CAL);
-        Ok(())
-    }
-
-    /// Gets the current position of the COBOT. This function blocks until the position is received.
-    pub fn get_position(&mut self) -> Result<[i16; 6], Box<dyn Error>> {
-        let mut serial_port = self.connect_to_serial()?;
-        let payload = self.send_and_wait(&mut serial_port, msg_type::MSG_GET, &[])?;
-        let (received_type, received_payload) = payload.ok_or("Received an ACK instead of POS")?;
-        if received_type != msg_type::MSG_POS {
-            return Err(format!("Received unexpected message type: {}", received_type).into());
-        }
-        if received_payload.len() != msg_type::PAYLOAD_LEN[received_type as usize] as usize {
-            return Err(format!(
-                "Received unexpected payload length: {}",
-                received_payload.len()
-            )
-            .into());
-        }
-
-        // Decode joint positions. Each is a 16-bit signed integer in little-endian format.
-        let mut positions = [0; 6];
-        for i in 0..6 {
-            positions[i] =
-                (received_payload[2 * i] as i16) | ((received_payload[2 * i + 1] as i16) << 8);
-        }
-
-        Ok(positions)
-    }
-
-    /// Moves a single joint to the specified position at the specified speed. If the speed is None,
-    /// the COBOT will follow a calculated acceleration profile. This function does not block until
-    /// the move is complete. Use wait_for_done() to wait for completion.
-    pub fn move_joint(
-        &mut self,
-        joint: u8,
-        position: i16,
-        speed: Option<f32>,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut joints = [None; 6];
-        if joint >= joints.len() as u8 {
-            return Err(format!("Invalid joint: {}", joint).into());
-        }
-
-        joints[joint as usize] = Some((position, speed));
-        self.move_all_joints(joints)
-    }
-
-    /// Moves the COBOT's joints to the specified positions at the specified speeds. If a speed is
-    /// None, the COBOT will follow a calculated acceleration profile. This function does not block
-    /// until the move is complete. Use wait_for_done() to wait for completion.
-    pub fn move_all_joints(
-        &mut self,
-        joints: [Option<(i16, Option<f32>)>; 6],
-    ) -> Result<(), Box<dyn Error>> {
-        // Encode joint positions and speeds. Each position is a 16-bit signed integer in
-        // little-endian format. Each speed is a little-endian IEEE 754 single-precision
-        // floating-point number. If a speed is None, it is encoded as `NaN`. If a joint is None,
-        // its position is encoded as `0x7FFF` and the speed is ignored.
-        let mut payload =
-            Vec::with_capacity(msg_type::PAYLOAD_LEN[msg_type::MSG_MOV as usize] as usize);
-
-        for joint in joints {
-            match joint {
-                Some((position, speed)) => {
-                    payload.push(position as u8);
-                    payload.push((position >> 8) as u8);
-                    match speed {
-                        Some(speed) => {
-                            payload.extend_from_slice(&speed.to_le_bytes());
-                        }
-                        None => {
-                            payload.extend_from_slice(&f32::NAN.to_le_bytes());
-                        }
-                    }
-                }
-                None => {
-                    payload.push(0xFF);
-                    payload.push(0x7F);
-                    payload.extend_from_slice(&f32::NAN.to_le_bytes());
-                }
-            }
-        }
-
-        let mut serial_port = self.connect_to_serial()?;
-        self.send_and_wait(&mut serial_port, msg_type::MSG_MOV, &payload)?;
-
-        Ok(())
-    }
-
-    /// Stops a specific joint. This is done by commanding a single joint to move at a speed of 0.
-    /// This function does not block until the move is complete. Use wait_for_done() to wait for
-    /// completion.
-    pub fn stop_joint(&mut self, joint: u8) -> Result<(), Box<dyn Error>> {
-        self.move_joint(joint, 0, Some(0.0))
-    }
-
-    /// Stops all joints. This will wait until all joints have stopped moving. To smoothly stop,
-    /// pass `true` for `smooth`. This will cause the COBOT to follow a calculated acceleration
-    /// profile to stop. If `smooth` is `false`, the COBOT will stop immediately.
-    pub fn stop_all(&mut self, smooth: bool) -> Result<(), Box<dyn Error>> {
-        let mut serial_port = self.connect_to_serial()?;
-        if smooth {
-            self.send_and_wait(&mut serial_port, msg_type::MSG_STP, &[0x01])?;
+    /// Error message.
+    pub message: String,
+}
+impl std::fmt::Display for CobotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let error_message = if self.code < ERROR_CODES.len() as u8 {
+            ERROR_CODES[self.code as usize]
         } else {
-            self.send_and_wait(&mut serial_port, msg_type::MSG_STP, &[0x00])?;
-        }
-        self.wait_for_done_serial(&mut serial_port, msg_type::MSG_STP);
-        Ok(())
-    }
-
-    /// Sends a message to the COBOT. This does not wait for a response.
-    pub fn send_msg(
-        &mut self,
-        serial_port: &mut Box<dyn SerialPort>,
-        msg_type: u8,
-        payload: &[u8],
-    ) -> Result<(), Box<dyn Error>> {
-        let mut msg = vec![0x55, msg_type];
-        msg.extend_from_slice(payload);
-        msg.push(crc8ccitt(&msg));
-
-        serial_port.write_all(&msg)?;
-
-        Ok(())
-    }
-
-    pub fn receive_msg(
-        &mut self,
-        serial_port: &mut Box<dyn SerialPort>,
-    ) -> Result<Vec<u8>, Box<dyn Error>> {
-        let mut received = Vec::with_capacity(3);
-
-        // Wait for start byte (0x24)
-        let mut buf = [0; 1];
-        loop {
-            match serial_port.read_exact(&mut buf) {
-                Ok(_) => {
-                    if buf[0] == 0x24 {
-                        received.push(0x24);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if e.kind() != ErrorKind::TimedOut {
-                        return Err(e.into());
-                    }
-                }
-            }
-        }
-
-        // Read message type
-        serial_port.read_exact(&mut buf)?;
-        received.push(buf[0]);
-
-        // Read payload if applicable
-        let payload_len = msg_type::PAYLOAD_LEN
-            .get(received[1] as usize)
-            .ok_or(format!("Invalid message type: {}", received[1]))?;
-        if *payload_len > 0 {
-            let mut payload = vec![0; *payload_len as usize];
-            serial_port.read_exact(&mut payload)?;
-            received.extend_from_slice(&payload);
-        }
-
-        // Read checksum
-        serial_port.read_exact(&mut buf)?;
-        received.push(buf[0]);
-
-        // Verify checksum
-        if !crc8ccitt_check(
-            &received[..received.len() - 1],
-            received[received.len() - 1],
-        ) {
-            return Err("Checksum mismatch".into());
-        }
-
-        Ok(received)
-    }
-
-    /// Sends a message to the COBOT and waits for a response. If the response is an error, an error
-    /// is returned. If the response is an ACK, None is returned. If the response is a message with
-    /// a payload, a tuple of the message type and payload is returned.
-    pub fn send_and_wait(
-        &mut self,
-        serial_port: &mut Box<dyn SerialPort>,
-        msg_type: u8,
-        payload: &[u8],
-    ) -> Result<Option<PayloadPair>, Box<dyn Error>> {
-        self.send_msg(serial_port, msg_type, payload)?;
-        loop {
-            let received = self.receive_msg(serial_port)?;
-            match received[1] {
-                // If error, return error
-                msg_type::MSG_ERR => return Err(format!("Error: {}", received[2]).into()),
-
-                // If ACK, return None
-                msg_type::MSG_ACK => return Ok(None),
-
-                // If DONE, add to done queue and wait for next message
-                msg_type::MSG_DONE => {
-                    self.done_queue.push(received[2]);
-                    continue;
-                }
-
-                // If message with payload, return message type and payload
-                _ => {
-                    return Ok(Some((
-                        received[1],
-                        received[2..received.len() - 1].to_vec(),
-                    )))
-                }
-            }
-        }
-    }
-
-    pub fn _wait_for_done(&mut self, msg_type: u8) {
-        let mut serial_port = match self.connect_to_serial() {
-            Ok(serial_port) => serial_port,
-            Err(e) => {
-                error!("Error connecting to serial port: {}", e);
-                return;
-            }
+            "Unknown error"
         };
+        write!(
+            f,
+            "COBOT ERROR {} ({}): {}",
+            self.code, error_message, self.message
+        )
+    }
+}
+impl std::error::Error for CobotError {}
 
-        self.wait_for_done_serial(&mut serial_port, msg_type);
+impl CobotConnection {
+    /// Creates a new connection to the COBOT.
+    ///
+    /// # Arguments
+    ///
+    /// * `port` - Serial port to communicate with the COBOT.
+    /// * `firmware_version` - Firmware version of the COBOT.
+    pub fn new(port: Box<dyn SerialPort>, firmware_version: u32, timeout: Duration) -> Self {
+        CobotConnection {
+            port,
+            firmware_version,
+            next_command_id: 0,
+            timeout,
+            responses: Vec::new(),
+        }
     }
 
-    /// Initializes the COBOT. This is required before the COBOT can be used.
-    fn init(&mut self, serial_port: &mut Box<dyn SerialPort>) -> Result<(), Box<dyn Error>> {
-        self.send_and_wait(
-            serial_port,
-            msg_type::MSG_INIT,
-            &[self.fw_major, self.fw_minor],
-        )?;
-        self.initialized = true;
+    /// Sends a request to the COBOT.
+    ///
+    /// # Arguments
+    ///
+    /// * `request_type` - Type of request to send.
+    /// * `payload` - Payload of the request.
+    ///
+    /// # Returns
+    ///
+    /// The command ID of the request.
+    pub fn send_request(
+        &mut self,
+        request_type: u8,
+        payload: &[u8],
+    ) -> Result<u32, Box<dyn Error>> {
+        let command_id = self.next_command_id;
+        self.next_command_id += 1;
+
+        let mut message = vec![request_type];
+        message.extend_from_slice(&command_id.to_le_bytes());
+        message.extend_from_slice(payload);
+
+        let crc = crc8ccitt(&message);
+        message.insert(0, crc);
+        message.insert(0, message.len() as u8);
+        message.insert(0, 0x24);
+
+        self.port.write_all(&message)?;
+
+        Ok(command_id)
+    }
+
+    /// Waits for a response from the COBOT. This will continually read from the serial port until
+    /// a response is received, or the timeout is reached.
+    ///
+    /// # Arguments
+    ///
+    /// * `command_id` - Command ID of the request to wait for.
+    ///
+    /// # Returns
+    ///
+    /// The response, or `None` if the response was not received before the timeout.
+    pub fn wait_for_response(
+        &mut self,
+        command_id: u32,
+    ) -> Result<Option<Response>, Box<dyn Error>> {
+        let start_time = Instant::now();
+
+        loop {
+            // Filter out any responses that are too old.
+            self.responses
+                .retain(|(_, time)| start_time - *time < Duration::from_secs(1));
+
+            // Check if the response has been received and return it if it has.
+            if let Some(response_idx) = self
+                .responses
+                .iter()
+                .position(|(response, _)| response.command_id == command_id)
+            {
+                return Ok(Some(self.responses.swap_remove(response_idx).0));
+            }
+
+            // Check if the timeout has been reached.
+            let time_elapsed = Instant::now() - start_time;
+            if time_elapsed >= self.timeout {
+                return Ok(None);
+            }
+
+            // Read a response from the serial port.
+            self.read_response(self.timeout - time_elapsed)?;
+        }
+    }
+
+    /// Wait for an ACK response from the COBOT. If an error response is received, it will be
+    /// returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `command_id` - Command ID of the request to wait for.
+    ///
+    /// # Returns
+    ///
+    /// Ok if an ACK response was received, or an error if an error response was received.
+    pub fn wait_for_ack(&mut self, command_id: u32) -> Result<(), Box<dyn Error>> {
+        match self.wait_for_response(command_id)? {
+            Some(response) => match response.response_type {
+                response_type::ACK => Ok(()),
+                response_type::ERROR => Err(Box::new(CobotError {
+                    code: response.payload[0],
+                    message: String::from_utf8_lossy(&response.payload[2..]).to_string(),
+                })),
+                _ => Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Received unexpected response type",
+                ))),
+            },
+            None => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timed out waiting for response",
+            ))),
+        }
+    }
+
+    /// Wait for a DONE response from the COBOT. If an error response is received, it will be
+    /// returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `command_id` - Command ID of the request to wait for.
+    ///
+    /// # Returns
+    ///
+    /// Ok if a DONE response was received, or an error if an error response was received.
+    pub fn wait_for_done(&mut self, command_id: u32) -> Result<(), Box<dyn Error>> {
+        match self.wait_for_response(command_id)? {
+            Some(response) => match response.response_type {
+                response_type::DONE => Ok(()),
+                response_type::ERROR => Err(Box::new(CobotError {
+                    code: response.payload[0],
+                    message: String::from_utf8_lossy(&response.payload[2..]).to_string(),
+                })),
+                _ => Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Received unexpected response type",
+                ))),
+            },
+            None => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timed out waiting for response",
+            ))),
+        }
+    }
+
+    /// Initialize the COBOT.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT was initialized successfully, or an error if the COBOT failed to initialize.
+    pub fn init(&mut self) -> Result<(), Box<dyn Error>> {
+        let payload = &self.firmware_version.to_le_bytes();
+        self.send_request(request_type::INIT, payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
 
         Ok(())
     }
 
-    fn wait_for_done_serial(&mut self, serial_port: &mut Box<dyn SerialPort>, msg_type: u8) {
-        loop {
-            // Search for the first instance of the message type in the done queue. If found, remove
-            // it and break.
-            let mut found = false;
-            self.done_queue.retain(|&x| {
-                if !found && x == msg_type {
-                    found = true;
-                    false
-                } else {
-                    true
-                }
-            });
-            if found {
-                break;
-            }
+    /// Calibrate the COBOT.
+    ///
+    /// # Arguments
+    ///
+    /// * `joints` - Bitfield of joints to calibrate.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT was calibrated successfully, or an error if the COBOT failed to calibrate.
+    pub fn calibrate(&mut self, joints: u8) -> Result<(), Box<dyn Error>> {
+        let payload = [joints];
+        self.send_request(request_type::CALIBRATE, &payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
 
-            // Wait for next message
-            let received = match self.receive_msg(serial_port) {
-                Ok(received) => received,
-                Err(e) => {
-                    error!("Error receiving message: {}", e);
-                    continue;
+        Ok(())
+    }
+
+    /// Get the current joint angles and speeds.
+    ///
+    /// # Returns
+    ///
+    /// Vector of tuples containing the joint angles and speeds in degrees and degrees per second,
+    /// respectively.
+    pub fn get_joints(&mut self) -> Result<Vec<(f32, f32)>, Box<dyn Error>> {
+        self.send_request(request_type::GET_JOINTS, &[])?;
+        let response = self.wait_for_response(self.next_command_id - 1)?;
+        match response {
+            Some(response) => match response.response_type {
+                response_type::JOINTS => {
+                    let joint_count = response.payload[0];
+                    let mut joints = Vec::new();
+                    for i in 0..joint_count {
+                        let angle = i32::from_le_bytes([
+                            response.payload[1 + i as usize * 8],
+                            response.payload[2 + i as usize * 8],
+                            response.payload[3 + i as usize * 8],
+                            response.payload[4 + i as usize * 8],
+                        ]) as f32
+                            / 1000.0;
+                        let speed = i32::from_le_bytes([
+                            response.payload[5 + i as usize * 8],
+                            response.payload[6 + i as usize * 8],
+                            response.payload[7 + i as usize * 8],
+                            response.payload[8 + i as usize * 8],
+                        ]) as f32
+                            / 1000.0;
+                        joints.push((angle, speed));
+                    }
+                    Ok(joints)
                 }
+                response_type::ERROR => Err(Box::new(CobotError {
+                    code: response.payload[0],
+                    message: String::from_utf8_lossy(&response.payload[2..]).to_string(),
+                })),
+                _ => Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Received unexpected response type",
+                ))),
+            },
+            None => Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Timed out waiting for response",
+            ))),
+        }
+    }
+
+    /// Move the given joints to the given angles at the given speeds. If a speed is `0` or `None`,
+    /// the COBOT will use the default speed.
+    ///
+    /// # Arguments
+    ///
+    /// * `joints` - List of tuples containing the joint ID, angle, and speed to move to.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT moved successfully, or an error if the COBOT failed to move.
+    pub fn move_to(&mut self, joints: &[(u8, f32, Option<f32>)]) -> Result<(), Box<dyn Error>> {
+        let mut payload = Vec::new();
+        for (joint_id, angle_f, speed_f) in joints {
+            let angle = (angle_f * 1000.0) as i32;
+            let speed = match speed_f {
+                Some(speed_f) => (speed_f * 1000.0) as i32,
+                None => 0,
             };
-            if received[1] == msg_type::MSG_DONE {
-                self.done_queue.push(received[2]);
+            payload.extend_from_slice(&joint_id.to_le_bytes());
+            payload.extend_from_slice(&angle.to_le_bytes());
+            payload.extend_from_slice(&speed.to_le_bytes());
+        }
+        self.send_request(request_type::MOVE_TO, &payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
+
+        Ok(())
+    }
+
+    /// Move the given joints at the given speeds.
+    ///
+    /// # Arguments
+    ///
+    /// * `joints` - List of tuples containing the joint ID and speed to move at.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT moved successfully, or an error if the COBOT failed to move.
+    #[allow(dead_code)]
+    pub fn move_speed(&mut self, joints: &[(u8, f32)]) -> Result<(), Box<dyn Error>> {
+        let mut payload = Vec::new();
+        for (joint_id, speed_f) in joints {
+            let speed = (speed_f * 1000.0) as i32;
+            payload.extend_from_slice(&joint_id.to_le_bytes());
+            payload.extend_from_slice(&speed.to_le_bytes());
+        }
+        self.send_request(request_type::MOVE_SPEED, &payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
+
+        Ok(())
+    }
+
+    /// Stop the given joints.
+    ///
+    /// # Arguments
+    ///
+    /// * `joints` - Bitfield of joints to stop.
+    /// * `immediately` - If true, the COBOT will stop immediately. Otherwise, it will decelerate
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT stopped successfully, or an error if the COBOT failed to stop.
+    pub fn stop(&mut self, joints: u8, immediately: bool) -> Result<(), Box<dyn Error>> {
+        let payload = [if immediately { 1 } else { 0 }, joints];
+        self.send_request(request_type::STOP, &payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
+
+        Ok(())
+    }
+
+    /// Home the given joints.
+    ///
+    /// # Arguments
+    ///
+    /// * `joints` - Bitfield of joints to home.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT homed successfully, or an error if the COBOT failed to home.
+    #[allow(dead_code)]
+    pub fn go_home(&mut self, joints: u8) -> Result<(), Box<dyn Error>> {
+        let payload = [joints];
+        self.send_request(request_type::GO_HOME, &payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
+
+        Ok(())
+    }
+
+    /// Reset the COBOT.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT reset successfully, or an error if the COBOT failed to reset.
+    #[allow(dead_code)]
+    pub fn reset(&mut self) -> Result<(), Box<dyn Error>> {
+        self.send_request(request_type::RESET, &[])?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
+
+        Ok(())
+    }
+
+    /// Set the log level of the COBOT.
+    ///
+    /// # Arguments
+    ///
+    /// * `log_level` - Log level to set.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT set the log level successfully, or an error if the COBOT failed to set the
+    /// log level.
+    #[allow(dead_code)]
+    pub fn set_log_level(&mut self, log_level: u8) -> Result<(), Box<dyn Error>> {
+        let payload = [log_level];
+        self.send_request(request_type::SET_LOG_LEVEL, &payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
+
+        Ok(())
+    }
+
+    /// Set the feedback of the given joints.
+    ///
+    /// # Arguments
+    ///
+    /// * `joints` - Bitfield of joints to enable/disable feedback.
+    ///
+    /// # Returns
+    ///
+    /// Ok if the COBOT set the feedback successfully, or an error if the COBOT failed to set the
+    /// feedback.
+    #[allow(dead_code)]
+    pub fn set_feedback(&mut self, joints: u8) -> Result<(), Box<dyn Error>> {
+        let payload = [joints];
+        self.send_request(request_type::SET_FEEDBACK, &payload)?;
+        self.wait_for_ack(self.next_command_id - 1)?;
+        self.wait_for_done(self.next_command_id - 1)?;
+
+        Ok(())
+    }
+
+    /// Reads a response from the serial port and adds it to the list of responses. If log messages
+    /// are received, they will be passed to the standard logger.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for the response.
+    ///
+    /// # Returns
+    ///
+    /// The response, or `None` if the response was not received before the timeout.
+    fn read_response(&mut self, timeout: Duration) -> Result<(), Box<dyn Error>> {
+        let start_time = Instant::now();
+
+        // Wait for a start byte.
+        let mut start_byte = [0];
+        while start_byte[0] != 0x24 {
+            self.read_exact(&mut start_byte, timeout - (Instant::now() - start_time))?;
+        }
+
+        // Read the length and CRC.
+        let mut length_crc = [0; 2];
+        self.read_exact(&mut length_crc, timeout - (Instant::now() - start_time))?;
+        let length = length_crc[0];
+        let crc = length_crc[1];
+
+        // Read the payload.
+        let mut payload = vec![0; length as usize];
+        self.read_exact(&mut payload, timeout - (Instant::now() - start_time))?;
+
+        // Check the CRC.
+        if !crc8ccitt_check(&payload, crc) {
+            warn!("Received message with invalid CRC");
+            return Ok(());
+        }
+
+        // Handle the message.
+        match payload[0] {
+            received_msg_type::LOG => {
+                let level = match payload[1] {
+                    log_level::DEBUG => log::Level::Debug,
+                    log_level::INFO => log::Level::Info,
+                    log_level::WARN => log::Level::Warn,
+                    log_level::ERROR => log::Level::Error,
+                    log_level::NONE => return Ok(()),
+                    _ => {
+                        warn!("Received message with invalid log level");
+                        return Ok(());
+                    }
+                };
+                let message = String::from_utf8_lossy(&payload[3..]);
+                log::logger().log(
+                    &log::Record::builder()
+                        .args(format_args!("{}", message))
+                        .level(level)
+                        .target("cobot")
+                        .file(Some("cobot"))
+                        .line(Some(0))
+                        .module_path(Some("cobot"))
+                        .build(),
+                );
+            }
+            received_msg_type::RESPONSE => {
+                let command_id =
+                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                let response_type = payload[5];
+                let payload = payload[6..].to_vec();
+
+                self.responses.push((
+                    Response {
+                        command_id,
+                        response_type,
+                        payload,
+                    },
+                    std::time::Instant::now(),
+                ));
+            }
+            _ => {
+                warn!("Received message with invalid type");
             }
         }
+
+        Ok(())
+    }
+
+    /// Reads enough bytes from the serial port to fill the given buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer` - Buffer to fill.
+    /// * `timeout` - Maximum time to wait for the buffer to be filled.
+    ///
+    /// # Returns
+    ///
+    /// True if the buffer was filled, or false if the timeout was reached before the buffer was
+    /// filled.
+    fn read_exact(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<bool, Box<dyn Error>> {
+        let start_time = Instant::now();
+        self.port
+            .set_timeout(timeout - (Instant::now() - start_time))?;
+        if let Err(e) = self.port.read_exact(buffer) {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                return Ok(false);
+            } else {
+                return Err(Box::new(e));
+            }
+        }
+
+        Ok(true)
     }
 }
