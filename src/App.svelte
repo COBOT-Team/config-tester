@@ -19,36 +19,48 @@
   let angles: Array<number> = Array(JOINTS.length).fill(0);
   let initialized = false;
 
+  async function connect_and_init() {
+    invoke("connect", { portName: "COM5", baudRate: 115200 })
+      .then(() => {
+        console.log("COBOT connected");
+        init();
+      })
+      .catch((e) => {
+        console.error(e);
+        setTimeout(connect_and_init, 1000);
+      });
+  }
+
   /**
    * Initialize and calibrate the COBOT. Then, start listening for joint angle updates.
    */
   async function init() {
-    await invoke("connect", { portName: "/dev/ttyCobot0", baudRate: 115200 })
-      .then(() => console.log("COBOT connected"))
-      .catch((e) => console.error(e));
-    await invoke("init", {})
-      .then(() => {
-        console.log("COBOT initialized");
-        initialized = true;
-        setInterval(() => {
-          invoke("get_position", {})
-            .then((angles) => {
-              if (Array.isArray(angles)) {
-                angles.forEach((angle, i) => {
-                  angles[i] = angle;
-                });
-              }
-            })
-            .catch((e) => console.error(e));
-        }, 1000);
-      })
-      .catch((e) => {
-        console.error(e);
-        setTimeout(init, 1000);
-      });
+    try {
+      await invoke("init", {});
+      console.log("COBOT initialized");
+      initialized = true;
+
+      setInterval(() => {
+        invoke("get_angles", {})
+          .then((angles) => {
+            if (Array.isArray(angles)) {
+              angles.forEach((angle, i) => {
+                angles[i] = angle;
+              });
+            }
+          })
+          .catch((e) => console.error(e));
+      }, 1000);
+
+      // await invoke("calibrate", { joints: 0b111111 });
+      // console.log("COBOT calibrated");
+    } catch (e) {
+      console.error(e);
+      setTimeout(init, 1000);
+    }
   }
 
-  init();
+  connect_and_init();
 </script>
 
 <main>

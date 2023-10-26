@@ -137,7 +137,7 @@
 //! | 0    | Bitfield of joints to enable/disable feedback |
 
 use crate::checksum::{crc8ccitt, crc8ccitt_check};
-use log::warn;
+use log::{info, warn};
 use serialport::SerialPort;
 use std::{
     error::Error,
@@ -292,10 +292,11 @@ impl CobotConnection {
         let mut message = vec![request_type];
         message.extend_from_slice(&command_id.to_le_bytes());
         message.extend_from_slice(payload);
+        let length = message.len() as u8;
 
         let crc = crc8ccitt(&message);
         message.insert(0, crc);
-        message.insert(0, message.len() as u8);
+        message.insert(0, length);
         message.insert(0, 0x24);
 
         self.port.write_all(&message)?;
@@ -309,6 +310,7 @@ impl CobotConnection {
     /// # Arguments
     ///
     /// * `command_id` - Command ID of the request to wait for.
+    /// * `timeout` - Maximum time to wait for the response.
     ///
     /// # Returns
     ///
@@ -316,13 +318,14 @@ impl CobotConnection {
     pub fn wait_for_response(
         &mut self,
         command_id: u32,
+        timeout: Duration,
     ) -> Result<Option<Response>, Box<dyn Error>> {
         let start_time = Instant::now();
 
         loop {
             // Filter out any responses that are too old.
             self.responses
-                .retain(|(_, time)| start_time - *time < Duration::from_secs(1));
+                .retain(|(_, time)| start_time < *time + Duration::from_secs(30));
 
             // Check if the response has been received and return it if it has.
             if let Some(response_idx) = self
@@ -335,12 +338,12 @@ impl CobotConnection {
 
             // Check if the timeout has been reached.
             let time_elapsed = Instant::now() - start_time;
-            if time_elapsed >= self.timeout {
+            if time_elapsed >= timeout {
                 return Ok(None);
             }
 
             // Read a response from the serial port.
-            self.read_response(self.timeout - time_elapsed)?;
+            self.read_response(timeout - time_elapsed)?;
         }
     }
 
@@ -355,7 +358,7 @@ impl CobotConnection {
     ///
     /// Ok if an ACK response was received, or an error if an error response was received.
     pub fn wait_for_ack(&mut self, command_id: u32) -> Result<(), Box<dyn Error>> {
-        match self.wait_for_response(command_id)? {
+        match self.wait_for_response(command_id, self.timeout)? {
             Some(response) => match response.response_type {
                 response_type::ACK => Ok(()),
                 response_type::ERROR => Err(Box::new(CobotError {
@@ -385,7 +388,7 @@ impl CobotConnection {
     ///
     /// Ok if a DONE response was received, or an error if an error response was received.
     pub fn wait_for_done(&mut self, command_id: u32) -> Result<(), Box<dyn Error>> {
-        match self.wait_for_response(command_id)? {
+        match self.wait_for_response(command_id, Duration::from_secs(60))? {
             Some(response) => match response.response_type {
                 response_type::DONE => Ok(()),
                 response_type::ERROR => Err(Box::new(CobotError {
@@ -443,7 +446,7 @@ impl CobotConnection {
     /// respectively.
     pub fn get_joints(&mut self) -> Result<Vec<(f32, f32)>, Box<dyn Error>> {
         self.send_request(request_type::GET_JOINTS, &[])?;
-        let response = self.wait_for_response(self.next_command_id - 1)?;
+        let response = self.wait_for_response(self.next_command_id - 1, self.timeout)?;
         match response {
             Some(response) => match response.response_type {
                 response_type::JOINTS => {
@@ -645,18 +648,18 @@ impl CobotConnection {
         // Wait for a start byte.
         let mut start_byte = [0];
         while start_byte[0] != 0x24 {
-            self.read_exact(&mut start_byte, timeout - (Instant::now() - start_time))?;
+            self.read_exact(&mut start_byte, self.remaining_timeout(start_time, timeout))?;
         }
 
         // Read the length and CRC.
         let mut length_crc = [0; 2];
-        self.read_exact(&mut length_crc, timeout - (Instant::now() - start_time))?;
+        self.read_exact(&mut length_crc, self.remaining_timeout(start_time, timeout))?;
         let length = length_crc[0];
         let crc = length_crc[1];
 
         // Read the payload.
         let mut payload = vec![0; length as usize];
-        self.read_exact(&mut payload, timeout - (Instant::now() - start_time))?;
+        self.read_exact(&mut payload, self.remaining_timeout(start_time, timeout))?;
 
         // Check the CRC.
         if !crc8ccitt_check(&payload, crc) {
@@ -691,19 +694,17 @@ impl CobotConnection {
                 );
             }
             received_msg_type::RESPONSE => {
+                let response_type = payload[1];
                 let command_id =
-                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                let response_type = payload[5];
+                    u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]]);
                 let payload = payload[6..].to_vec();
 
-                self.responses.push((
-                    Response {
-                        command_id,
-                        response_type,
-                        payload,
-                    },
-                    std::time::Instant::now(),
-                ));
+                let response = Response {
+                    command_id,
+                    response_type,
+                    payload,
+                };
+                self.responses.push((response, std::time::Instant::now()));
             }
             _ => {
                 warn!("Received message with invalid type");
@@ -725,9 +726,7 @@ impl CobotConnection {
     /// True if the buffer was filled, or false if the timeout was reached before the buffer was
     /// filled.
     fn read_exact(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<bool, Box<dyn Error>> {
-        let start_time = Instant::now();
-        self.port
-            .set_timeout(timeout - (Instant::now() - start_time))?;
+        self.port.set_timeout(timeout)?;
         if let Err(e) = self.port.read_exact(buffer) {
             if e.kind() == std::io::ErrorKind::TimedOut {
                 return Ok(false);
@@ -737,5 +736,25 @@ impl CobotConnection {
         }
 
         Ok(true)
+    }
+
+    /// Determine the remaining time until the timeout is reached. Will return 0 if the timeout has
+    /// already been reached.
+    ///
+    /// # Arguments
+    ///
+    /// * `start_time` - Time the timeout started.
+    /// * `timeout` - Timeout duration.
+    ///
+    /// # Returns
+    ///
+    /// The remaining time until the timeout is reached.
+    fn remaining_timeout(&self, start_time: Instant, timeout: Duration) -> Duration {
+        let time_elapsed = Instant::now() - start_time;
+        if time_elapsed >= timeout {
+            Duration::from_secs(0)
+        } else {
+            timeout - time_elapsed
+        }
     }
 }
