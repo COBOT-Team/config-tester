@@ -16,12 +16,20 @@
       "shell": {
         "all": false,
         "open": true
+      },
+      "dialog": {
+        "all": false,
+        "ask": false,
+        "confirm": false,
+        "message": true,
+        "open": false,
+        "save": false
       }
     },
     "bundle": {
       "active": true,
       "targets": "all",
-      "identifier": "com.tauri.dev",
+      "identifier": "tech.zachchampion.cobot-config-tester",
       "icon": [
         "icons/32x32.png",
         "icons/128x128.png",

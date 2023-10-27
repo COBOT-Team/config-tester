@@ -17,63 +17,91 @@
   ];
 
   let angles: Array<number> = Array(JOINTS.length).fill(0);
+  let connected = false;
   let initialized = false;
 
-  async function connect_and_init() {
-    invoke("connect", { portName: "COM5", baudRate: 115200 })
-      .then(() => {
-        console.log("COBOT connected");
-        init();
-      })
-      .catch((e) => {
-        console.error(e);
-        setTimeout(connect_and_init, 1000);
-      });
-  }
+  invoke("is_connected", {}).then((isConnected) => {
+    connected = isConnected ? true : false;
+    if (connected) {
+      init();
+    }
+  });
+
+  let portName = "/dev/ttyCobot0";
+  let baudRate = 115200;
 
   /**
    * Initialize and calibrate the COBOT. Then, start listening for joint angle updates.
    */
-  async function init() {
-    try {
-      await invoke("init", {});
-      console.log("COBOT initialized");
-      initialized = true;
+  function init() {
+    console.log("Initializing COBOT...");
+    invoke("init", {})
+      .then(() => {
+        console.log("COBOT initialized");
+        initialized = true;
 
-      setInterval(() => {
-        invoke("get_angles", {})
-          .then((angles) => {
-            if (Array.isArray(angles)) {
-              angles.forEach((angle, i) => {
-                angles[i] = angle;
-              });
-            }
-          })
-          .catch((e) => console.error(e));
-      }, 1000);
-
-      // await invoke("calibrate", { joints: 0b111111 });
-      // console.log("COBOT calibrated");
-    } catch (e) {
-      console.error(e);
-      setTimeout(init, 1000);
-    }
+        setInterval(() => {
+          invoke("get_angles", {})
+            .then((received) => {
+              if (Array.isArray(received)) {
+                received.forEach((angle, i) => {
+                  angles[i] = angle;
+                });
+              }
+            })
+            .catch((e) => console.error(e));
+        }, 100);
+      })
+      .catch((e) => {
+        window.alert(e);
+        invoke("disconnect", {}).then(() => (connected = false));
+      });
   }
-
-  connect_and_init();
 </script>
 
 <main>
   <h1 id="title">COBOT Config Tester</h1>
 
-  {#if initialized}
-    <div id="joints-container">
-      {#each JOINTS as joint}
-        <JointControl id={joint.id} name={joint.name} angle={angles[joint.id]} />
-      {/each}
-    </div>
+  {#if connected}
+    {#if initialized}
+      <button on:click={() => invoke("calibrate", { joints: 0b111111 })}>Calibrate All</button>
+      <div id="joints-container">
+        {#each JOINTS as joint}
+          <JointControl id={joint.id} name={joint.name} angle={angles[joint.id]} />
+        {/each}
+      </div>
+    {:else}
+      <p>Initializing...</p>
+    {/if}
   {:else}
-    <p>Initializing...</p>
+    <!-- Input serial port and baud rate -->
+    <div id="input-area">
+      <div class="input-container">
+        <label for="port-name">Port name:</label>
+        <input id="port-name" type="text" placeholder="Port name" bind:value={portName} />
+      </div>
+      <div class="input-container">
+        <label for="baud-rate">Baud rate:</label>
+        <input id="baud-rate" type="number" placeholder="Baud rate" bind:value={baudRate} />
+      </div>
+    </div>
+
+    <!-- Connect button -->
+    <div>
+      <button
+        on:click={() => {
+          invoke("connect", { portName, baudRate })
+            .then(() => {
+              console.log("COBOT connected");
+              connected = true;
+              init();
+            })
+            .catch((e) => window.alert(e));
+        }}
+      >
+        Connect
+      </button>
+    </div>
   {/if}
 </main>
 
@@ -99,5 +127,22 @@
 
     box-sizing: border-box;
     margin: 16px;
+  }
+
+  #input-area {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    margin: 32px;
+  }
+
+  .input-container {
+    display: flex;
+    flex-direction: row;
+    margin: 8px;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
   }
 </style>

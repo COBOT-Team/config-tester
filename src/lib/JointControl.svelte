@@ -20,7 +20,7 @@
   // Validity of input strings
   $: angleInputValid = angleInput !== null && angleInput >= minAngle && angleInput <= maxAngle;
   $: speedInputValid = speedInput !== null && speedInput >= minSpeed && speedInput <= maxSpeed;
-  $: moving = targetSpeed !== 0;
+  $: moving = targetAngle != angle;
 
   /**
    * Move the joint to the specified angle at the specified speed.

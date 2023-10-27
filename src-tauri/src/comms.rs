@@ -137,7 +137,7 @@
 //! | 0    | Bitfield of joints to enable/disable feedback |
 
 use crate::checksum::{crc8ccitt, crc8ccitt_check};
-use log::{info, warn};
+use log::warn;
 use serialport::SerialPort;
 use std::{
     error::Error,
@@ -648,18 +648,24 @@ impl CobotConnection {
         // Wait for a start byte.
         let mut start_byte = [0];
         while start_byte[0] != 0x24 {
-            self.read_exact(&mut start_byte, self.remaining_timeout(start_time, timeout))?;
+            if !self.read_exact(&mut start_byte, self.remaining_timeout(start_time, timeout))? {
+                return Err("Timed out waiting for start byte".into());
+            }
         }
 
         // Read the length and CRC.
-        let mut length_crc = [0; 2];
-        self.read_exact(&mut length_crc, self.remaining_timeout(start_time, timeout))?;
+        let mut length_crc = [0, 0];
+        if !self.read_exact(&mut length_crc, self.remaining_timeout(start_time, timeout))? {
+            return Err("Timed out waiting for length and CRC".into());
+        }
         let length = length_crc[0];
         let crc = length_crc[1];
 
         // Read the payload.
         let mut payload = vec![0; length as usize];
-        self.read_exact(&mut payload, self.remaining_timeout(start_time, timeout))?;
+        if !self.read_exact(&mut payload, self.remaining_timeout(start_time, timeout))? {
+            return Err("Timed out waiting for payload".into());
+        }
 
         // Check the CRC.
         if !crc8ccitt_check(&payload, crc) {

@@ -15,6 +15,12 @@ struct AppState {
     cobot: Mutex<Option<Box<CobotConnection>>>,
 }
 
+/// Check whether the cobot is connected.
+#[tauri::command]
+async fn is_connected(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.cobot.lock().await.is_some())
+}
+
 /// Connect to the cobot over the given serial port.
 #[tauri::command]
 async fn connect(
@@ -24,11 +30,11 @@ async fn connect(
 ) -> Result<(), String> {
     let mut cobot = state.cobot.lock().await;
     if cobot.is_some() {
-        return Err("Already connected".to_string());
+        return Ok(());
     }
 
     let port = serialport::new(port_name, baud_rate)
-        .timeout(std::time::Duration::from_millis(100))
+        .timeout(std::time::Duration::from_millis(1000))
         .open()
         .map_err(|e| format!("Failed to open port: {}", e))?;
 
@@ -42,12 +48,7 @@ async fn connect(
 #[tauri::command]
 async fn disconnect(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let mut cobot = state.cobot.lock().await;
-    if cobot.is_none() {
-        return Err("Not connected".to_string());
-    }
-
     *cobot = None;
-
     Ok(())
 }
 
@@ -65,10 +66,21 @@ async fn init(state: tauri::State<'_, AppState>) -> Result<(), String> {
         .init()
         .map_err(|e| format!("Failed to initialize: {}", e))?;
 
+    Ok(())
+}
+
+/// Calibrate the cobot.
+#[tauri::command]
+async fn calibrate(state: tauri::State<'_, AppState>, joints: u8) -> Result<(), String> {
+    let mut cobot = state.cobot.lock().await;
+    if cobot.is_none() {
+        return Err("Not connected".to_string());
+    }
+
     cobot
         .as_mut()
         .unwrap()
-        .calibrate(0b111111)
+        .calibrate(joints)
         .map_err(|e| format!("Failed to calibrate: {}", e))?;
 
     Ok(())
@@ -146,7 +158,14 @@ fn main() {
             cobot: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
-            connect, disconnect, init, get_angles, move_joint, stop_joint
+            is_connected,
+            connect,
+            disconnect,
+            init,
+            calibrate,
+            get_angles,
+            move_joint,
+            stop_joint
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
