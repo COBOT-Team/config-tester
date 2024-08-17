@@ -47,6 +47,7 @@
                 received.forEach((angle, i) => {
                   angles[i] = angle;
                 });
+                angles = [...angles];
               }
             })
             .catch((e) => console.error(e));
